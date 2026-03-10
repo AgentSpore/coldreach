@@ -165,3 +165,40 @@ async def get_stats(db, campaign_id: int) -> dict | None:
         "cost_per_open": round(cost / opens, 4) if opens else None,
         "cost_per_reply": round(cost / replies, 4) if replies else None,
     }
+
+
+async def list_recipients(db, campaign_id: int) -> list:
+    db.row_factory = aiosqlite.Row
+    rows = await (await db.execute(
+        "SELECT * FROM recipients WHERE campaign_id=? ORDER BY id ASC", (campaign_id,)
+    )).fetchall()
+    return [
+        {
+            "id": r["id"], "campaign_id": r["campaign_id"],
+            "email": r["email"], "first_name": r["first_name"],
+            "last_name": r["last_name"], "company": r["company"],
+            "custom": json.loads(r["custom"]) if r["custom"] else None,
+        }
+        for r in rows
+    ]
+
+
+async def list_campaign_events(db, campaign_id: int, event_type: str | None = None) -> list:
+    db.row_factory = aiosqlite.Row
+    if event_type:
+        rows = await (await db.execute(
+            "SELECT * FROM events WHERE campaign_id=? AND event_type=? ORDER BY id DESC",
+            (campaign_id, event_type),
+        )).fetchall()
+    else:
+        rows = await (await db.execute(
+            "SELECT * FROM events WHERE campaign_id=? ORDER BY id DESC", (campaign_id,)
+        )).fetchall()
+    return [
+        {
+            "id": r["id"], "campaign_id": r["campaign_id"],
+            "recipient_email": r["recipient_email"],
+            "event_type": r["event_type"], "recorded_at": r["recorded_at"],
+        }
+        for r in rows
+    ]
