@@ -1,8 +1,8 @@
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel
 from typing import Optional
 
 
-PRICE_PER_EMAIL = 0.002  # $0.002 per email sent
+PRICE_PER_EMAIL = 0.002
 
 
 class RecipientIn(BaseModel):
@@ -13,12 +13,22 @@ class RecipientIn(BaseModel):
     custom: Optional[dict] = None
 
 
+class RecipientResponse(BaseModel):
+    id: int
+    campaign_id: int
+    email: str
+    first_name: Optional[str]
+    last_name: Optional[str]
+    company: Optional[str]
+    custom: Optional[dict]
+
+
 class CampaignCreate(BaseModel):
     name: str
     from_name: str
     from_email: str
-    subject_template: str    # supports {{first_name}}, {{company}}
-    body_template: str       # plain text, supports {{first_name}}, {{company}}
+    subject_template: str
+    body_template: str
     recipients: list[RecipientIn]
 
 
@@ -28,7 +38,7 @@ class CampaignResponse(BaseModel):
     from_name: str
     from_email: str
     subject_template: str
-    status: str              # draft | scheduled | sending | sent | paused
+    status: str
     recipient_count: int
     sent_count: int
     opened_count: int
@@ -49,7 +59,15 @@ class SendResponse(BaseModel):
 class EventIn(BaseModel):
     campaign_id: int
     recipient_email: str
-    event_type: str   # opened | clicked | replied | bounced | unsubscribed
+    event_type: str
+
+
+class EventResponse(BaseModel):
+    id: int
+    campaign_id: int
+    recipient_email: str
+    event_type: str
+    recorded_at: str
 
 
 class StatsResponse(BaseModel):
