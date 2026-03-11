@@ -1,8 +1,15 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Depends, Query
 import aiosqlite
-from models import CampaignCreate, CampaignResponse, SendResponse, EventIn, EventResponse, RecipientResponse, StatsResponse
-from engine import init_db, create_campaign, list_campaigns, get_campaign, send_campaign, record_event, get_stats, list_recipients, list_campaign_events
+from models import (
+    CampaignCreate, CampaignResponse, SendResponse, EventIn, EventResponse,
+    RecipientResponse, StatsResponse, ABTestCreate, ABTestResponse, ABWinnerResponse,
+)
+from engine import (
+    init_db, create_campaign, list_campaigns, get_campaign, send_campaign,
+    record_event, get_stats, list_recipients, list_campaign_events,
+    create_ab_test, get_ab_test, pick_ab_winner,
+)
 
 DB_PATH = "coldreach.db"
 
@@ -16,8 +23,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="ColdReach",
-    description="Pay-as-you-go cold email campaign manager. Create campaigns with templates, track recipients, record engagement events. PAYG pricing at $0.002/email — no $80/mo flat fee.",
-    version="1.1.0",
+    description="Pay-as-you-go cold email campaign manager. Create campaigns with templates, track recipients, record engagement events, run A/B tests on subject lines. PAYG pricing at $0.002/email.",
+    version="1.2.0",
     lifespan=lifespan,
 )
 
@@ -96,3 +103,35 @@ async def log_event(body: EventIn, db=Depends(get_db)):
         raise HTTPException(404, "Campaign not found")
     await record_event(db, body.campaign_id, body.recipient_email, body.event_type)
     return {"status": "recorded"}
+
+
+@app.post("/campaigns/{campaign_id}/ab-test", response_model=ABTestResponse, status_code=201)
+async def start_ab_test(campaign_id: int, body: ABTestCreate, db=Depends(get_db)):
+    """Start A/B test on subject lines. Sends sample_pct of recipients split across variants."""
+    c = await get_campaign(db, campaign_id)
+    if not c:
+        raise HTTPException(404, "Campaign not found")
+    if c["status"] not in ("draft",):
+        raise HTTPException(409, f"Campaign status is '{c['status']}', must be 'draft' to start A/B test")
+    try:
+        return await create_ab_test(db, campaign_id, body.variants, body.sample_pct)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.get("/campaigns/{campaign_id}/ab-test", response_model=ABTestResponse)
+async def view_ab_test(campaign_id: int, db=Depends(get_db)):
+    """View A/B test status with per-variant open/click rates."""
+    result = await get_ab_test(db, campaign_id)
+    if not result:
+        raise HTTPException(404, "No A/B test found for this campaign")
+    return result
+
+
+@app.post("/campaigns/{campaign_id}/ab-test/pick-winner", response_model=ABWinnerResponse)
+async def select_winner(campaign_id: int, db=Depends(get_db)):
+    """Auto-select best variant by open rate and send remaining recipients with winning subject."""
+    try:
+        return await pick_ab_winner(db, campaign_id)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
