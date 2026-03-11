@@ -1,6 +1,7 @@
 import aiosqlite
 import json
 import re
+import random
 from datetime import datetime
 
 DB_PATH = "coldreach.db"
@@ -48,6 +49,29 @@ async def init_db():
                 event_type TEXT NOT NULL,
                 recorded_at TEXT NOT NULL,
                 FOREIGN KEY (campaign_id) REFERENCES campaigns(id)
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS ab_tests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                campaign_id INTEGER NOT NULL UNIQUE,
+                variants TEXT NOT NULL,
+                sample_pct REAL NOT NULL,
+                status TEXT NOT NULL DEFAULT 'running',
+                winner_variant INTEGER,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (campaign_id) REFERENCES campaigns(id)
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS ab_sends (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                test_id INTEGER NOT NULL,
+                variant_idx INTEGER NOT NULL,
+                recipient_id INTEGER NOT NULL,
+                recipient_email TEXT NOT NULL,
+                FOREIGN KEY (test_id) REFERENCES ab_tests(id),
+                FOREIGN KEY (recipient_id) REFERENCES recipients(id)
             )
         """)
         await db.commit()
@@ -202,3 +226,182 @@ async def list_campaign_events(db, campaign_id: int, event_type: str | None = No
         }
         for r in rows
     ]
+
+
+async def create_ab_test(db, campaign_id: int, variants: list[str], sample_pct: float) -> dict:
+    db.row_factory = aiosqlite.Row
+
+    existing = await (await db.execute(
+        "SELECT id FROM ab_tests WHERE campaign_id=?", (campaign_id,)
+    )).fetchone()
+    if existing:
+        raise ValueError("A/B test already exists for this campaign")
+
+    all_recipients = await (await db.execute(
+        "SELECT id, email FROM recipients WHERE campaign_id=?", (campaign_id,)
+    )).fetchall()
+
+    total = len(all_recipients)
+    if total < len(variants):
+        raise ValueError(f"Need at least {len(variants)} recipients, got {total}")
+
+    sample_size = max(len(variants), int(total * sample_pct / 100))
+    sample_size = min(sample_size, total)
+
+    recipient_list = [(r["id"], r["email"]) for r in all_recipients]
+    random.shuffle(recipient_list)
+    sample = recipient_list[:sample_size]
+
+    now = datetime.utcnow().isoformat()
+    cur = await db.execute(
+        "INSERT INTO ab_tests (campaign_id, variants, sample_pct, status, created_at) VALUES (?,?,?,?,?)",
+        (campaign_id, json.dumps(variants), sample_pct, "running", now),
+    )
+    test_id = cur.lastrowid
+
+    for i, (rid, email) in enumerate(sample):
+        variant_idx = i % len(variants)
+        await db.execute(
+            "INSERT INTO ab_sends (test_id, variant_idx, recipient_id, recipient_email) VALUES (?,?,?,?)",
+            (test_id, variant_idx, rid, email),
+        )
+
+    cost = round(sample_size * PRICE_PER_EMAIL, 4)
+    await db.execute(
+        "UPDATE campaigns SET sent_count = sent_count + ?, cost_usd = cost_usd + ?, status = 'ab_testing' WHERE id=?",
+        (sample_size, cost, campaign_id),
+    )
+    await db.commit()
+
+    return await get_ab_test(db, campaign_id)
+
+
+async def get_ab_test(db, campaign_id: int) -> dict | None:
+    db.row_factory = aiosqlite.Row
+
+    test = await (await db.execute(
+        "SELECT * FROM ab_tests WHERE campaign_id=?", (campaign_id,)
+    )).fetchone()
+    if not test:
+        return None
+
+    variants = json.loads(test["variants"])
+    test_id = test["id"]
+
+    total_recipients = await _recipient_count(db, campaign_id)
+    sampled = await (await db.execute(
+        "SELECT COUNT(*) FROM ab_sends WHERE test_id=?", (test_id,)
+    )).fetchone()
+    sampled_count = sampled[0] if sampled else 0
+
+    variant_stats = []
+    for idx, subject in enumerate(variants):
+        row = await (await db.execute(
+            "SELECT COUNT(*) FROM ab_sends WHERE test_id=? AND variant_idx=?", (test_id, idx)
+        )).fetchone()
+        sent = row[0] if row else 0
+
+        emails = await (await db.execute(
+            "SELECT recipient_email FROM ab_sends WHERE test_id=? AND variant_idx=?", (test_id, idx)
+        )).fetchall()
+        email_set = {e["recipient_email"] for e in emails}
+
+        opened = 0
+        clicked = 0
+        if email_set:
+            placeholders = ",".join("?" for _ in email_set)
+            opened_row = await (await db.execute(
+                f"SELECT COUNT(DISTINCT recipient_email) FROM events WHERE campaign_id=? AND event_type='opened' AND recipient_email IN ({placeholders})",
+                (campaign_id, *email_set),
+            )).fetchone()
+            opened = opened_row[0] if opened_row else 0
+
+            clicked_row = await (await db.execute(
+                f"SELECT COUNT(DISTINCT recipient_email) FROM events WHERE campaign_id=? AND event_type='clicked' AND recipient_email IN ({placeholders})",
+                (campaign_id, *email_set),
+            )).fetchone()
+            clicked = clicked_row[0] if clicked_row else 0
+
+        variant_stats.append({
+            "variant_idx": idx,
+            "subject": subject,
+            "sent": sent,
+            "opened": opened,
+            "clicked": clicked,
+            "open_rate_pct": round(opened / sent * 100, 1) if sent else 0.0,
+            "click_rate_pct": round(clicked / sent * 100, 1) if sent else 0.0,
+        })
+
+    winner_subject = None
+    if test["winner_variant"] is not None:
+        winner_subject = variants[test["winner_variant"]]
+
+    return {
+        "id": test["id"],
+        "campaign_id": campaign_id,
+        "status": test["status"],
+        "sample_pct": test["sample_pct"],
+        "total_sample": sampled_count,
+        "variants": variant_stats,
+        "winner_variant": test["winner_variant"],
+        "winner_subject": winner_subject,
+        "remaining_to_send": total_recipients - sampled_count,
+        "created_at": test["created_at"],
+    }
+
+
+async def pick_ab_winner(db, campaign_id: int) -> dict:
+    db.row_factory = aiosqlite.Row
+
+    test_data = await get_ab_test(db, campaign_id)
+    if not test_data:
+        raise ValueError("No A/B test found for this campaign")
+    if test_data["status"] == "completed":
+        raise ValueError("A/B test already completed")
+
+    best = max(test_data["variants"], key=lambda v: (v["open_rate_pct"], v["click_rate_pct"]))
+    winner_idx = best["variant_idx"]
+    winner_subject = best["subject"]
+
+    test = await (await db.execute(
+        "SELECT id FROM ab_tests WHERE campaign_id=?", (campaign_id,)
+    )).fetchone()
+    test_id = test["id"]
+
+    sent_rids = await (await db.execute(
+        "SELECT recipient_id FROM ab_sends WHERE test_id=?", (test_id,)
+    )).fetchall()
+    sent_rid_set = {r["recipient_id"] for r in sent_rids}
+
+    all_recipients = await (await db.execute(
+        "SELECT id, email FROM recipients WHERE campaign_id=?", (campaign_id,)
+    )).fetchall()
+    remaining = [(r["id"], r["email"]) for r in all_recipients if r["id"] not in sent_rid_set]
+    remaining_count = len(remaining)
+
+    for rid, email in remaining:
+        await db.execute(
+            "INSERT INTO ab_sends (test_id, variant_idx, recipient_id, recipient_email) VALUES (?,?,?,?)",
+            (test_id, winner_idx, rid, email),
+        )
+
+    await db.execute(
+        "UPDATE ab_tests SET status='completed', winner_variant=? WHERE id=?",
+        (winner_idx, test_id),
+    )
+
+    cost_remaining = round(remaining_count * PRICE_PER_EMAIL, 4)
+    await db.execute(
+        "UPDATE campaigns SET sent_count = sent_count + ?, cost_usd = cost_usd + ?, status = 'sent', subject_template = ? WHERE id=?",
+        (remaining_count, cost_remaining, winner_subject, campaign_id),
+    )
+    await db.commit()
+
+    return {
+        "campaign_id": campaign_id,
+        "test_id": test_id,
+        "winner_variant": winner_idx,
+        "winner_subject": winner_subject,
+        "remaining_sent": remaining_count,
+        "cost_usd": cost_remaining,
+    }
