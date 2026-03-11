@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional
 
 
@@ -81,3 +81,40 @@ class StatsResponse(BaseModel):
     cost_usd: float
     cost_per_open: Optional[float]
     cost_per_reply: Optional[float]
+
+
+class ABTestCreate(BaseModel):
+    variants: list[str] = Field(..., min_length=2, max_length=5, description="Subject line variants to test")
+    sample_pct: float = Field(20.0, gt=0, le=50, description="Percent of recipients for the test sample (split evenly across variants)")
+
+
+class ABVariantStats(BaseModel):
+    variant_idx: int
+    subject: str
+    sent: int
+    opened: int
+    clicked: int
+    open_rate_pct: float
+    click_rate_pct: float
+
+
+class ABTestResponse(BaseModel):
+    id: int
+    campaign_id: int
+    status: str
+    sample_pct: float
+    total_sample: int
+    variants: list[ABVariantStats]
+    winner_variant: Optional[int]
+    winner_subject: Optional[str]
+    remaining_to_send: int
+    created_at: str
+
+
+class ABWinnerResponse(BaseModel):
+    campaign_id: int
+    test_id: int
+    winner_variant: int
+    winner_subject: str
+    remaining_sent: int
+    cost_usd: float
